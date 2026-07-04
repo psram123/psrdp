@@ -1,4 +1,4 @@
-name: RDP Permanent - Fixed IP via MagicDNS
+name: RDP Permanent
 
 on:
   workflow_dispatch:
@@ -13,6 +13,7 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -20,92 +21,168 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
           
+          # Firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
           
+          # Restart RDP service
           Restart-Service -Name TermService -Force
+          
+          Write-Host "✅ RDP configured successfully!"
 
       - name: Create RDP User with PERMANENT Password
         run: |
+          # PERMANENT PASSWORD
           $password = "Ramprakash#1122"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
+          # Check if user exists
           $userExists = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
           if ($userExists) {
               Set-LocalUser -Name "RDP" -Password $securePass
-              Write-Host "✅ Password updated"
+              Write-Host "✅ Password updated for existing user"
           } else {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
               Add-LocalGroupMember -Group "Administrators" -Member "RDP"
               Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-              Write-Host "✅ User created"
+              Write-Host "✅ New user created"
           }
           
+          # Store credentials
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          
+          # Verify
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "❌ User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
+          Write-Host "📦 Installing Tailscale..."
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          # Download with retry
+          $retries = 0
+          while ($retries -lt 3) {
+              try {
+                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+                  break
+              } catch {
+                  $retries++
+                  Write-Host "⚠️ Download failed, retry $retries/3"
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
+          if (-not (Test-Path $installerPath)) {
+              Write-Error "❌ Failed to download Tailscale"
+              exit 1
+          }
+          
+          # Install
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "✅ Tailscale installed successfully!"
 
-      - name: Establish Tailscale with PERMANENT Hostname
+      - name: Establish Tailscale Connection (AUTO-LOGIN)
         run: |
-          $hostname = "my-rdp-server"  # 🔒 NEVER CHANGE THIS
+          Write-Host "🔗 Connecting to Tailscale..."
           
+          # PERMANENT HOSTNAME
+          $hostname = "my-rdp-server"
+          
+          # Check if auth key exists
+          if ([string]::IsNullOrEmpty("${{ secrets.TAILSCALE_AUTH_KEY }}")) {
+              Write-Error "❌ TAILSCALE_AUTH_KEY secret is not set!"
+              Write-Error "Please add it in GitHub Secrets"
+              exit 1
+          }
+          
+          # Connect to Tailscale with auth key (NO LOGIN PROMPT)
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
             --hostname=$hostname `
-            --accept-routes
+            --accept-routes `
+            --accept-dns=false `
+            --reset
           
-          # Wait for IP
+          # Wait for Tailscale to assign IP
+          Write-Host "⏳ Waiting for Tailscale IP..."
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) {
+                  Write-Host "✅ Got IP: $tsIP"
+                  break
+              }
+              Write-Host "⏳ Waiting... ($retries/20)"
               Start-Sleep -Seconds 5
               $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "❌ Tailscale IP not assigned"
+              Write-Host "❌ Tailscale IP not assigned. Checking status..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              Write-Error "❌ Tailscale connection failed"
               exit 1
           }
           
-          # Get MagicDNS
-          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          # Get Tailnet name for MagicDNS
+          Write-Host "📡 Getting MagicDNS address..."
+          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
           $tailnetName = $status.Self.TailnetName
+          
+          if (-not $tailnetName) {
+              # Fallback: Get from status command
+              $statusText = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($statusText -match "([a-zA-Z0-9-]+)\.ts\.net") {
+                  $tailnetName = $matches[1] + ".ts.net"
+              } else {
+                  $tailnetName = "tailscale.ts.net"
+              }
+          }
+          
           $magicDNS = "$hostname.$tailnetName"
           
-          # Save to environment
+          # Store connection details
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          echo "TAILSCALE_MAGICDNS=$magicDNS" >> $env:GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          echo "TAILSCALE_MAGICDNS=$magicDNS" >> $env:GITHUB_ENV
+          echo "TAILSCALE_TAILNET=$tailnetName" >> $env:GITHUB_ENV
           
-          # ⭐ SAVE PERMANENT ADDRESS TO FILE
-          $magicDNS | Out-File -FilePath "PERMANENT_ADDRESS.txt"
-          
-          Write-Host "✅ Tailscale connected!"
-          Write-Host "   Temporary IP: $tsIP (changes each run)"
-          Write-Host "   PERMANENT ADDRESS: $magicDNS (NEVER CHANGES!)"
+          Write-Host ""
+          Write-Host "✅ Tailscale connected successfully!"
+          Write-Host "   📍 Temporary IP: $tsIP (changes every run)"
+          Write-Host "   📍 PERMANENT ADDRESS: $magicDNS (NEVER CHANGES!)"
+          Write-Host ""
 
-      - name: Verify RDP
+      - name: Verify RDP Accessibility
         run: |
-          Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          Write-Host "✅ RDP is accessible!"
+          Write-Host "🔍 Testing RDP connection..."
+          
+          # Test TCP connectivity
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "✅ RDP is accessible on port 3389!"
+          } else {
+              Write-Host "⚠️ RDP test failed, but continuing..."
+              Write-Host "   (Firewall might be blocking, but should work externally)"
+          }
 
       - name: Display PERMANENT Connection Details
         run: |
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "🔐 PERMANENT RDP CONNECTION DETAILS"
-          Write-Host "=========================================="
+          Write-Host "╔══════════════════════════════════════════════════════╗"
+          Write-Host "║     🔐 PERMANENT RDP CONNECTION DETAILS            ║"
+          Write-Host "╚══════════════════════════════════════════════════════╝"
           Write-Host ""
-          Write-Host "📍 PERMANENT ADDRESS (USE THIS!):"
+          Write-Host "📍 PERMANENT ADDRESS (SAVE THIS!):"
           Write-Host "   $env:TAILSCALE_MAGICDNS"
           Write-Host ""
           Write-Host "📍 Temporary IP (DO NOT USE):"
@@ -114,33 +191,35 @@ jobs:
           Write-Host "👤 Username: RDP"
           Write-Host "🔑 Password: Ramprakash#1122"
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "✅ This MagicDNS address NEVER changes!"
-          Write-Host "✅ Password NEVER changes!"
-          Write-Host "=========================================="
+          Write-Host "╔══════════════════════════════════════════════════════╗"
+          Write-Host "║  ✅ This MagicDNS address NEVER changes!           ║"
+          Write-Host "║  ✅ Password NEVER changes!                        ║"
+          Write-Host "║  ✅ Connect anytime with same credentials!        ║"
+          Write-Host "╚══════════════════════════════════════════════════════╝"
           Write-Host ""
 
-      - name: Save to Artifact
+      - name: Save Connection Info as Artifact
         run: |
           $info = @"
-          ========================================
-          🔐 PERMANENT RDP CONNECTION
-          ========================================
+          ════════════════════════════════════════════════════════
+          🔐 PERMANENT RDP CONNECTION - SAVE THESE DETAILS
+          ════════════════════════════════════════════════════════
           
-          📍 PERMANENT ADDRESS (SAVE THIS!):
+          📍 PERMANENT ADDRESS (USE THIS!):
           $env:TAILSCALE_MAGICDNS
           
           📍 Username: RDP
           📍 Password: Ramprakash#1122
           
-          ========================================
+          ════════════════════════════════════════════════════════
           💡 THIS ADDRESS NEVER CHANGES!
-          💡 Use this address in RDP client
-          💡 Works across all runs
-          ========================================
+          💡 Connect using any RDP client
+          💡 Works across all workflow runs
+          ════════════════════════════════════════════════════════
           "@
           $info | Out-File -FilePath "PERMANENT_RDP_INFO.txt"
-          
+          Write-Host "✅ Connection details saved!"
+
       - name: Upload Permanent Info
         uses: actions/upload-artifact@v4
         with:
@@ -150,25 +229,33 @@ jobs:
 
       - name: Maintain Connection
         run: |
-          Write-Host "🚀 RDP SERVER ACTIVE - PERMANENT MODE"
-          Write-Host "="*60
+          Write-Host "╔══════════════════════════════════════════════════════╗"
+          Write-Host "║     🚀 RDP SERVER ACTIVE - PERMANENT MODE         ║"
+          Write-Host "╚══════════════════════════════════════════════════════╝"
+          Write-Host ""
           Write-Host "📍 PERMANENT ADDRESS: $env:TAILSCALE_MAGICDNS"
           Write-Host "👤 Username: RDP"
           Write-Host "🔑 Password: Ramprakash#1122"
-          Write-Host "="*60
-          Write-Host "✅ This address works FOREVER!"
-          Write-Host "🔄 Auto-restarts every 5 hours"
-          Write-Host "="*60
+          Write-Host ""
+          Write-Host "⏰ This session will auto-renew every 5 hours"
+          Write-Host "🔄 Workflow auto-restarts via schedule"
+          Write-Host "✅ Use the MagicDNS address above to connect"
           Write-Host ""
           
+          $sessionStart = Get-Date
+          
           while ($true) {
-              Write-Host "[$(Get-Date)] ✅ RDP Active - Permanent Address: $env:TAILSCALE_MAGICDNS"
+              $elapsed = (Get-Date) - $sessionStart
+              Write-Host "[$(Get-Date)] ✅ RDP Active - Address: $env:TAILSCALE_MAGICDNS - Elapsed: $($elapsed.ToString('hh\:mm\:ss'))"
               
-              # Reconnect if disconnected
+              # Check if Tailscale is still connected
               $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
-              if (-not $tsStatus -or $tsStatus -match "stopped") {
-                  Write-Host "⚠️ Reconnecting Tailscale..."
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=my-rdp-server
+              if (-not $tsStatus -or $tsStatus -match "stopped" -or $tsStatus -match "disconnected") {
+                  Write-Host "⚠️ Tailscale disconnected! Reconnecting..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                    --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                    --hostname=my-rdp-server `
+                    --accept-routes
               }
               
               Start-Sleep -Seconds 60

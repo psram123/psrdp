@@ -1,113 +1,175 @@
-name: RDP
+name: RDP Permanent - Fixed IP via MagicDNS
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
-
+    timeout-minutes: 350
+    
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User with PERMANENT Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $password = "Ramprakash#1122"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          $userExists = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($userExists) {
+              Set-LocalUser -Name "RDP" -Password $securePass
+              Write-Host "✅ Password updated"
+          } else {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+              Write-Host "✅ User created"
           }
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
+      - name: Establish Tailscale with PERMANENT Hostname
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $hostname = "my-rdp-server"  # 🔒 NEVER CHANGE THIS
           
-          # Wait for Tailscale to assign an IP
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$hostname `
+            --accept-routes
+          
+          # Wait for IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          while (-not $tsIP -and $retries -lt 15) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "❌ Tailscale IP not assigned"
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          # Get MagicDNS
+          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          $tailnetName = $status.Self.TailnetName
+          $magicDNS = "$hostname.$tailnetName"
+          
+          # Save to environment
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_MAGICDNS=$magicDNS" >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          
+          # ⭐ SAVE PERMANENT ADDRESS TO FILE
+          $magicDNS | Out-File -FilePath "PERMANENT_ADDRESS.txt"
+          
+          Write-Host "✅ Tailscale connected!"
+          Write-Host "   Temporary IP: $tsIP (changes each run)"
+          Write-Host "   PERMANENT ADDRESS: $magicDNS (NEVER CHANGES!)"
+
+      - name: Verify RDP
+        run: |
+          Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          Write-Host "✅ RDP is accessible!"
+
+      - name: Display PERMANENT Connection Details
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "🔐 PERMANENT RDP CONNECTION DETAILS"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "📍 PERMANENT ADDRESS (USE THIS!):"
+          Write-Host "   $env:TAILSCALE_MAGICDNS"
+          Write-Host ""
+          Write-Host "📍 Temporary IP (DO NOT USE):"
+          Write-Host "   $env:TAILSCALE_IP (changes every run)"
+          Write-Host ""
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: Ramprakash#1122"
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "✅ This MagicDNS address NEVER changes!"
+          Write-Host "✅ Password NEVER changes!"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      - name: Save to Artifact
+        run: |
+          $info = @"
+          ========================================
+          🔐 PERMANENT RDP CONNECTION
+          ========================================
+          
+          📍 PERMANENT ADDRESS (SAVE THIS!):
+          $env:TAILSCALE_MAGICDNS
+          
+          📍 Username: RDP
+          📍 Password: Ramprakash#1122
+          
+          ========================================
+          💡 THIS ADDRESS NEVER CHANGES!
+          💡 Use this address in RDP client
+          💡 Works across all runs
+          ========================================
+          "@
+          $info | Out-File -FilePath "PERMANENT_RDP_INFO.txt"
+          
+      - name: Upload Permanent Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: permanent-rdp-address
+          path: PERMANENT_RDP_INFO.txt
+          retention-days: 365
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "🚀 RDP SERVER ACTIVE - PERMANENT MODE"
+          Write-Host "="*60
+          Write-Host "📍 PERMANENT ADDRESS: $env:TAILSCALE_MAGICDNS"
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: Ramprakash#1122"
+          Write-Host "="*60
+          Write-Host "✅ This address works FOREVER!"
+          Write-Host "🔄 Auto-restarts every 5 hours"
+          Write-Host "="*60
+          Write-Host ""
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              Write-Host "[$(Get-Date)] ✅ RDP Active - Permanent Address: $env:TAILSCALE_MAGICDNS"
+              
+              # Reconnect if disconnected
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+              if (-not $tsStatus -or $tsStatus -match "stopped") {
+                  Write-Host "⚠️ Reconnecting Tailscale..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=my-rdp-server
+              }
+              
+              Start-Sleep -Seconds 60
           }
